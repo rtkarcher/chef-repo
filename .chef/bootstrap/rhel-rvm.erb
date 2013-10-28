@@ -1,0 +1,191 @@
+#!/bin/bash
+
+# Script
+# Default Ruby version installed via rvm is 1.9.3-p125
+# If rvm is installed but Ruby is not then it will install that ruby and set it to default.
+# If rvm is not installed then it will install rvm at a system level and then install Ruby 
+
+RUBY_VERSION="<%= @chef_config[:ruby_version] %>"
+RUBY_VERSION=${RUBY_VERSION:-"1.9.3-p125"}
+RHEL_VERSION=$(sed "s/.*release \([0-9]\).*$/\1/g" /etc/redhat-release)
+EPEL_VERSION=$(curl -s http://dl.fedoraproject.org/pub/epel/${RHEL_VERSION}/x86_64/ | grep -P -o "epel-release-[\d]+-[\d]+.noarch.rpm" | head -n1)
+
+if [ -z $EPEL_VERSION ]; then
+  echo "FATAL: Unable to determine current EPEL version."
+  exit 1
+fi
+
+echo "Fetching epel release version $EPEL_VERSION..."
+
+install_rvm() {
+  FILENAME=/tmp/rvm_install.sh
+  curl -L get.rvm.io -o $FILENAME
+
+  if [[ $? != 0 ]]
+  then
+    echo "Could not get RVM installer. Exiting."
+    exit 1
+  fi
+
+  sudo bash $FILENAME 1.16.20
+  RES=$?
+  rm $FILENAME
+
+  if [[ $RES != 0 ]]
+  then
+    echo "RVM install script failed."
+    exit 1
+  fi
+}
+
+case $RHEL_VERSION in
+  6)
+    if [ -d /usr/local/rvm ]; then
+      if [ ! -d /usr/local/rvm/rubies/$RUBY_VERSION ]; then
+        rpm -Uvh http://dl.fedoraproject.org/pub/epel/${RHEL_VERSION}/x86_64/$EPEL_VERSION
+        yum -y install patch.x86_64 readline.x86_64 readline-devel.x86_64 zlib.x86_64 zlib-devel.x86_64 openssl-devel.x86_64 make.x86_64 bzip2.x86_64 automake.noarch libtool.x86_64 bison.x86_64
+      fi
+    else
+      rpm -Uvh http://dl.fedoraproject.org/pub/epel/${RHEL_VERSION}/x86_64/$EPEL_VERSION
+      yum -y install patch.x86_64 readline.x86_64 readline-devel.x86_64 zlib.x86_64 zlib-devel.x86_64 openssl-devel.x86_64 make.x86_64 bzip2.x86_64 automake.noarch libtool.x86_64 bison.x86_64
+      install_rvm
+    fi
+    ;;
+  5)
+    if ! (cat ~/.curlrc | grep insecure > /dev/null);then echo insecure >> ~/.curlrc;fi
+    
+    if [ -d /usr/local/rvm ]; then
+      if [ ! -d /usr/local/rvm/rubies/$RUBY_VERSION ]; then
+        yum -y install patch.x86_64 readline.x86_64 readline-devel.x86_64 zlib.x86_64 zlib-devel.x86_64 openssl-devel.x86_64 make.x86_64 bzip2.x86_64 automake.noarch libtool.x86_64 bison.x86_64
+        if ! (/usr/bin/autoconf -V|grep 2.63 > /dev/null); then
+          wget -q -N http://ftp.gnu.org/gnu/autoconf/autoconf-2.63.tar.gz
+          if [[ $? != 0 ]]
+          then
+            echo "Could not get autoconf package. Exiting"
+            exit 1
+          fi
+          tar -xzf autoconf-2.63.tar.gz;cd autoconf-2.63;./configure --prefix=/usr > /dev/null;make > /dev/null;make install > /dev/null;cd ..;rm -rf autoconf-2.63*
+        fi
+      fi
+    else
+      rpm -Uvh http://dl.fedoraproject.org/pub/epel/${RHEL_VERSION}/x86_64/$EPEL_VERSION
+      yum -y install patch.x86_64 readline.x86_64 readline-devel.x86_64 zlib.x86_64 zlib-devel.x86_64 openssl-devel.x86_64 make.x86_64 bzip2.x86_64 automake.noarch libtool.x86_64 bison.x86_64
+      if ! (/usr/bin/autoconf -V|grep 2.63 > /dev/null); then
+        wget -q -N http://ftp.gnu.org/gnu/autoconf/autoconf-2.63.tar.gz
+        if [[ $? != 0 ]]
+        then
+          echo "Could not get autoconf package. Exiting"
+          exit 1
+        fi
+        tar -xzf autoconf-2.63.tar.gz;cd autoconf-2.63;./configure --prefix=/usr > /dev/null;make > /dev/null;make install > /dev/null;cd ..;rm -rf autoconf-2.63*
+      fi
+      install_rvm
+    fi
+    ;;
+  *)
+    echo "FATAL: Invalid Redhat Version detected."
+    exit 1
+    ;;
+esac
+
+
+source /etc/profile.d/rvm.sh
+
+if [[ -z $(rvm list | grep $RUBY_VERSION) ]]; then
+  command rvm install $RUBY_VERSION
+fi
+
+# lets grab a public key to append for auto-login
+PUBLIC_KEY="<%=
+if @chef_config[:ssh_public_key].nil?
+  # if we don't define a public key, grab the system public key
+  keyfile="/etc/ssh/ssh_host_rsa_key.pub"
+  "#{File.read("/etc/ssh/ssh_host_rsa_key.pub").chomp} #{%x(hostname).chomp}"
+else
+  keyfile=@chef_config[:ssh_public_key].to_s
+  "#{File.read(@chef_config[:ssh_public_key].to_s).chomp}"
+end
+%>"
+
+# verify that the key we are trying to add isn't already added to the root user
+if [[ -z $(grep "$PUBLIC_KEY" /root/.ssh/authorized_keys) ]]; then
+  echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+  echo "Added public key. Use private key \"<%= keyfile.gsub(".pub","") %>\" when connecting"
+fi
+
+source /usr/local/rvm/scripts/rvm
+
+# Make sure the correct ruby is being used
+usermod -a -G rvm root
+rvm $RUBY_VERSION --default
+
+# specify non-default rubygem source
+RUBYGEM_SOURCE="<%= @chef_config[:rubygem_source] %>"
+RUBYGEM_SOURCE=${RUBYGEM_SOURCE:-"http://repo.release.cerner.corp/internal/rubygems/"}
+
+# make chef version a variable
+CHEF_VERSION="<%= @chef_config[:chef_version] %>"
+CHEF_VERSION=${CHEF_VERSION:-"0.10.8.6"}
+
+# Add release rubygems repo and install chef-server and dependencies
+gem sources -a "$RUBYGEM_SOURCE"
+
+gem install chef -v $CHEF_VERSION --no-ri --no-rdoc
+
+mkdir /etc/chef
+
+# set the location of the client.rb file to be loaded during the chef run
+CLIENT_CONFIG="<%= @chef_config[:client_config].to_s %>"
+CLIENT_CONFIG=${CLIENT_CONFIG:-"/etc/chef/client.rb"}
+
+# set the location of the client key file to be used in the chef run
+CLIENT_KEY="<%=@config[:client_key] if @config[:client_key]%>"
+CLIENT_KEY=${CLIENT_KEY:-"<%= @chef_config[:client_bootstrap_key].to_s %>"}
+CLIENT_KEY=${CLIENT_KEY:-"/etc/chef/client.pem"}
+
+# specify an alias command to use
+CHEF_CLIENT_COMMAND="<%= @chef_config[:client_command].to_s %>"
+CHEF_CLIENT_COMMAND=${CHEF_CLIENT_COMMAND:-"chef-client"}
+
+(
+cat <<'EOP'
+<%= config_content %>
+EOP
+) > $CLIENT_CONFIG
+
+(
+cat <<'EOP'
+<%= validation_key %>
+EOP
+) > /tmp/validation.pem
+awk NF /tmp/validation.pem > /etc/chef/validation.pem
+rm /tmp/validation.pem
+
+<% if @chef_config[:encrypted_data_bag_secret] -%>
+(
+cat <<'EOP'
+<%= encrypted_data_bag_secret %>
+EOP
+) > /tmp/encrypted_data_bag_secret
+awk NF /tmp/encrypted_data_bag_secret > /etc/chef/encrypted_data_bag_secret
+rm /tmp/encrypted_data_bag_secret
+<% end -%>
+
+(
+cat <<'EOP'
+<%= { "run_list" => @run_list }.to_json %>
+EOP
+) > /etc/chef/first-boot.json
+
+chef-client -c $CLIENT_CONFIG -j /etc/chef/first-boot.json -k $CLIENT_KEY
+
+CLIENT_COMMAND_SCRIPT=". ~/.bashrc
+chef-client -c $CLIENT_CONFIG -k $CLIENT_KEY \$@"
+
+if [[ -n $(diff /usr/bin/$CHEF_CLIENT_COMMAND <(echo "$CLIENT_COMMAND_SCRIPT") 2>&1) ]] && [[ "$CHEF_CLIENT_COMMAND" != "chef-client" ]]; then
+        echo "$CLIENT_COMMAND_SCRIPT" > /usr/bin/$CHEF_CLIENT_COMMAND
+        chmod +x /usr/bin/$CHEF_CLIENT_COMMAND
+fi
+
+rm /etc/chef/first-boot.json
+rm /etc/chef/validation.pem

@@ -1,0 +1,244 @@
+#!/bin/bash
+
+<%= "export http_proxy=\"#{knife_config[:bootstrap_proxy]}\"" if knife_config[:bootstrap_proxy] -%>
+
+
+########################################################
+##
+## Checks that the specified component exists
+##
+########################################################
+exists() {
+  if command -v $1 &>/dev/null
+  then
+    return 0
+  else
+    return 1
+  fi
+}
+
+
+########################################################
+##
+## Install chef server from internally stored RPM
+##
+########################################################
+function installCernerChef()
+{
+  MACHINE=$(echo -e `uname -m`)
+  PLATFORM_VERSION=$(sed 's/^.\+ release \([.0-9]\+\).*/\1/' /etc/redhat-release)
+  MAJOR_VERSION=$(echo $PLATFORM_VERSION | cut -d. -f1)
+
+  echo "Scanning target device:"
+  echo "  Target Chef Version: ${CHEF_VERSION}"
+  echo "  Machine: ${MACHINE}"
+  echo "  Platform Version: ${PLATFORM_VERSION}"
+  echo -e "\nLooking for internally hosted compatible installer."
+
+  URL="http://repo.release.cerner.corp/external/repo/com/opscode/chef/chef"
+  URL=${URL}"/${CHEF_VERSION}-1.el${MAJOR_VERSION}"
+  URL=${URL}"/chef-${CHEF_VERSION}-1.el${MAJOR_VERSION}-${MACHINE}.rpm"
+
+  TEMP_INSTALL_FILE="/tmp/chef-install.rpm"
+  if exists wget
+  then
+    wget -O ${TEMP_INSTALL_FILE} ${URL}
+  elif exists curl
+  then
+    curl -s -L -o ${TEMP_INSTALL_FILE} ${URL}
+  else
+    echo "Neither wget nor curl found. Please install one and try again." >&2
+    exit 1
+  fi
+
+  RES=$?
+  (( $RES )) && echo "No compatible installer found; falling back to Opscode install script." && return $RES
+
+  echo "Compatible installer found; installing Chef/Chef-Client"
+
+  rpm -Uvh $TEMP_INSTALL_FILE
+  RES=$?
+
+  rm $TEMP_INSTALL_FILE
+
+  (( $RES )) && echo "Installer failed"
+
+  return $RES
+}
+
+
+########################################################
+##
+## Install chef server using script hosted by Opscode
+##
+########################################################
+function installOpscodeChef()
+{
+  echo "Installing Chef/Chef-Client via Omnibus using Opscode hosted components."
+  SCRIPT_URL="http://opscode.com/chef/install.sh"
+  INSTALL_SCRIPT=/tmp/chef_install.sh
+
+  if exists wget
+  then
+    wget <%= "--proxy=on " if knife_config[:bootstrap_proxy] %> -O $INSTALL_SCRIPT ${SCRIPT_URL}
+  elif exists curl
+  then
+    curl -L -s <%= "--proxy \"#{knife_config[:bootstrap_proxy]}\" " if knife_config[:bootstrap_proxy] %>\
+       -o $INSTALL_SCRIPT ${SCRIPT_URL}
+  else
+    echo "Neither wget nor curl found. Please install one and try again." >&2
+    exit 1
+  fi
+
+  if [[ $? != 0 ]]
+  then
+    echo "Could not find Opscode installer script; remote install failed. Exiting." >&2
+    exit 1
+  fi
+
+  bash $INSTALL_SCRIPT -v $CHEF_VERSION
+  RES=$?
+
+  (( $RES )) && echo "Installer failed"
+  return $RES
+}
+
+
+# ======================
+#   SCRIPT ENTRY POINT
+# ======================
+
+CHEF_VERSION="<%= chef_version %>"
+
+if $(type rvm | head -n 1 | grep -q "rvm is a function"); then
+  echo "rvm is installed"
+  if $(which chef-client | grep -q "rvm"); then
+    echo "Removing chef and related components on the default rvm ruby."
+    $MY_RUBY_HOME/bin/gem uninstall chef -x -a
+  fi
+  echo "Removing RVM concerns and changing to system ruby if there is one."
+  rvm system
+  unset GEM_HOME
+  unset GEM_PATH
+else
+  echo "rvm is not installed"
+fi
+
+# Attempt install using components hosted internally
+installCernerChef
+
+# If internal-install failed, resort to external-install
+if [[ $? != 0 ]]
+then
+  # Could not install from internal components
+  installOpscodeChef
+
+  if [[ $? != 0 ]]
+  then
+    echo "Could not install chef, chef-client" >&2
+    exit 1
+  fi
+fi
+
+
+# lets grab a public key to append for auto-login
+PUBLIC_KEY="<%=
+if @chef_config[:ssh_public_key].nil?
+  # if we dont define a public key, grab the system public key
+  keyfile="/etc/ssh/ssh_host_rsa_key.pub"
+  "#{File.read("/etc/ssh/ssh_host_rsa_key.pub").chomp} #{%x(hostname).chomp}"
+else
+  keyfile=@chef_config[:ssh_public_key].to_s
+  "#{File.read(@chef_config[:ssh_public_key].to_s).chomp}"
+end
+%>"
+
+# verify that the key we are trying to add isnt already added to the root user
+if [[ -z $(grep "$PUBLIC_KEY" /root/.ssh/authorized_keys) ]]; then
+  echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+  echo "Added public key. Use private key \"<%= keyfile.gsub(".pub","") %>\" when connecting"
+fi
+
+[[ ! -d /etc/chef ]] && mkdir -p /etc/chef
+
+# set the location of the client.rb file to be loaded during the chef run
+CLIENT_CONFIG="<%= @chef_config[:client_config].to_s %>"
+CLIENT_CONFIG=${CLIENT_CONFIG:-"/etc/chef/client.rb"}
+
+# set the location of the client key file to be used in the chef run
+CLIENT_KEY="<%=@config[:client_key] if @config[:client_key]%>"
+CLIENT_KEY=${CLIENT_KEY:-"<%= @chef_config[:client_bootstrap_key].to_s %>"}
+CLIENT_KEY=${CLIENT_KEY:-"/etc/chef/client.pem"}
+
+# specify an alias command to use
+CHEF_CLIENT_COMMAND="<%= @chef_config[:client_command].to_s %>"
+CHEF_CLIENT_COMMAND=${CHEF_CLIENT_COMMAND:-"chef-client"}
+
+
+awk NF > /etc/chef/validation.pem <<'EOP'
+<%= validation_key %>
+EOP
+chmod 0600 /etc/chef/validation.pem
+
+<% if @chef_config[:encrypted_data_bag_secret] -%>
+awk NF > /etc/chef/encrypted_data_bag_secret <<'EOP'
+<%= encrypted_data_bag_secret %>
+EOP
+chmod 0600 /etc/chef/encrypted_data_bag_secret
+<% end -%>
+
+<%# Generate Ohai Hints -%>
+<% unless @chef_config[:knife][:hints].nil? || @chef_config[:knife][:hints].empty? -%>
+[[ ! -d /etc/chef/ohai/hints ]] && mkdir -p /etc/chef/ohai/hints
+
+<% @chef_config[:knife][:hints].each do |name, hash| -%>
+cat > /etc/chef/ohai/hints/<%= name %>.json <<'EOP'
+<%= hash.to_json %>
+EOP
+<% end ## End of @chef_config.each loop -%>
+<% end ## End of unless block -%>
+
+cat > /etc/chef/client.rb <<'EOP'
+<%= config_content %>
+EOP
+
+cat > /etc/chef/first-boot.json <<'EOP'
+<%= (@config[:first_boot_attributes] || {}).merge(:run_list => @run_list).to_json %>
+EOP
+
+# Setup chef-client and chef concerns to step around rvm
+<% chef_executables = ['chef-client', 'chef-solo', 'knife', 'ohai', 'shef'] %>
+<% chef_executables.each do |exe| %>
+# remove symlink
+rm /usr/bin/<%= exe %>
+# replace with small script
+cat > /usr/bin/<%= exe %> <<'EOP'
+#!/bin/sh
+unset GEM_HOME
+unset GEM_PATH
+exec /opt/chef/bin/<%= exe %> $@
+EOP
+chmod +x /usr/bin/<%= exe %>
+<% end ## End of chef_executables.each loop -%>
+
+<%= start_chef %> -c $CLIENT_CONFIG -k $CLIENT_KEY
+
+CLIENT_COMMAND_SCRIPT=". ~/.bashrc
+chef-client -c $CLIENT_CONFIG -k $CLIENT_KEY \$@"
+if (( $? != 0 ))
+then
+  echo "Chef client install failed" >&2
+  rm -f /etc/chef/first-boot.json
+  rm -f /etc/chef/validation.pem
+  exit 1
+fi
+
+if [[ -n $(diff /usr/bin/$CHEF_CLIENT_COMMAND <(echo "$CLIENT_COMMAND_SCRIPT") 2>&1) ]] && [[ "$CHEF_CLIENT_COMMAND" != "chef-client" ]]; then
+        echo "$CLIENT_COMMAND_SCRIPT" > /usr/bin/$CHEF_CLIENT_COMMAND
+        chmod +x /usr/bin/$CHEF_CLIENT_COMMAND
+fi
+
+
+rm /etc/chef/first-boot.json
+rm /etc/chef/validation.pem
+

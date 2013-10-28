@@ -1,0 +1,83 @@
+# Script
+# Default Ruby version installed is 1.9.3-p125
+# Ruby is installed by Ruby Installer.
+
+SET RUBY_VERSION=<%= @chef_config[:ruby_version] %>
+IF "%RUBY_VERSION%" == "" SET RUBY_VERSION=1.9.3-p125
+
+<%= "SETX HTTP_PROXY \"#{knife_config[:bootstrap_proxy]}\"" if knife_config[:bootstrap_proxy] %>
+<%= "SETX HTTPS_PROXY \"#{knife_config[:bootstrap_proxy]}\"" if knife_config[:bootstrap_proxy] %>
+mkdir C:\chef
+
+> C:\chef\wget.vbs (
+ <%= win_wget %>
+)
+
+setx Path "%PATH%;c:\ruby\bin" -m
+
+cscript /nologo C:\chef\wget.vbs /url:http://files.rubyforge.vm.bytemark.co.uk/rubyinstaller/rubyinstaller-%RUBY_VERSION%.exe /path:%TEMP%\rubyinstaller.exe
+%TEMP%\rubyinstaller.exe /verysilent /dir="C:\ruby" /tasks="assocfiles,modpath"
+
+@rem Install the Ruby Dev Kit so we compile us some native gems
+cscript /nologo C:\chef\wget.vbs /url:http://cloud.github.com/downloads/oneclick/rubyinstaller/DevKit-tdm-32-4.5.2-20111229-1559-sfx.exe /path:%TEMP%\rubydevkit.exe
+mkdir C:\DevKit
+copy %TEMP%\rubydevkit.exe C:\DevKit
+cmd.exe /C C:\DevKit\rubydevkit.exe -y
+
+@rem customize settings from configuration file.
+SET CLIENT_CONFIG=<%= @chef_config[:client_config].to_s %>
+IF "%CLIENT_CONFIG%" == "" SET CLIENT_CONFIG=c:\chef\client.rb
+
+SET CHEF_CLIENT_COMMAND=<%= @chef_config[:client_command].to_s %>
+IF "%CHEF_CLIENT_COMMAND%" == "" SET CHEF_CLIENT_COMMAND=chef-client
+
+@rem Add release rubygems repo and install chef-server and dependencies
+SET RUBYGEM_SOURCE=<%= @chef_config[:rubygem_source] %>
+IF "%RUBYGEM_SOURCE%" == "" SET RUBYGEM_SOURCE=http://repo.release.cerner.corp/internal/rubygems/
+
+cmd.exe /C C:/ruby/bin/ruby c:/DevKit/dk.rb init
+cmd.exe /C C:/ruby/bin/ruby c:/DevKit/dk.rb install
+
+cmd.exe /C C:/ruby/bin/gem sources -a %RUBYGEM_SOURCE%
+cmd.exe /C C:/ruby/bin/gem install win32-api win32-service --platform=mswin32 --no-rdoc --no-ri
+cmd.exe /C C:/ruby/bin/gem install win32-process --version 0.6.6 --no-rdoc --no-ri
+cmd.exe /C C:/ruby/bin/gem install rdp-ruby-wmi windows-api windows-pr ffi --no-rdoc --no-ri
+
+@rem Install Chef gems separately to prevent 'failed to allocate memory' errors
+cmd.exe /C C:/ruby/bin/gem install ohai --no-rdoc --no-ri
+cmd.exe /C C:/ruby/bin/gem install chef --no-rdoc --no-ri <%= bootstrap_version_string %>
+
+> C:\chef\validation.pem (
+ <%= validation_key %>
+)
+
+<% if @config[:encrypted_data_bag_secret] -%>
+> C:\chef\encrypted_data_bag_secret (
+ <%= encrypted_data_bag_secret %>
+)
+<% end -%>
+
+> %CLIENT_CONFIG% (
+ echo.require 'win32ole'
+ echo.WIN32OLE.codepage = WIN32OLE::CP_UTF8
+ <%= config_content %>
+)
+
+> C:\chef\first-boot.json (
+ <%= run_list %>
+)
+
+<%= "type %CLIENT_CONFIG%|findstr /v _proxy > c:\\chef\\temp.rb" if knife_config[:bootstrap_proxy] %>
+<%= "move /Y c:\\chef\\temp.rb %CLIENT_CONFIG%" if knife_config[:bootstrap_proxy] %>
+
+> C:\ruby\bin\%CHEF_CLIENT_COMMAND%.bat (
+echo.@ECHO OFF
+echo.IF NOT "%%~f0" == "~f0" GOTO :WinNT
+echo.@"C:/ruby/bin/ruby.exe" "C:/ruby/bin/chef-client" -c %CLIENT_CONFIG% %%1 %%2 %%3 %%4 %%5 %%6 %%7 %%8 %%9
+echo.GOTO :EOF
+echo.:WinNT
+echo.@"C:/ruby/bin/ruby.exe" "C:/ruby/bin/chef-client" -c %CLIENT_CONFIG% %%*
+)
+
+SET "PATH=%PATH%;C:\ruby\bin"
+c:\ruby\bin\%CHEF_CLIENT_COMMAND% -c %CLIENT_CONFIG% -j c:/chef/first-boot.json
